@@ -133,7 +133,7 @@ O rate limiting (20 eventos/s) e o clamp de movimento (±12 px) já são aplicad
 
 ## 5. Diagrama de Blocos do Firmware
 
-![alt text](image-3.png)
+![alt text](image-4.png)
 
 
 ### Tasks
