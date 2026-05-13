@@ -28,12 +28,12 @@ O firmware roda em uma **Raspberry Pi Pico** com **FreeRTOS**, sem variáveis gl
 
 ### Imagens
 
-> *(adicionar imagens do protótipo aqui — proposta + montagem real)*
->
-> - `docs/proposta.png` — esboço/render da proposta inicial
-> - `docs/controle_real.jpg` — foto do controle montado
-> - `docs/jogando.gif` — gif jogando com o controle
 
+ideias: 
+
+![alt text](image-1.png)
+
+![alt text](image-2.png)
 ---
 
 ## 3. Entradas e Saídas
