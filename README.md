@@ -133,7 +133,8 @@ O **rate limiting** (20 eventos/s) e o **clamp de movimento** (±12 px) já são
 
 ## 5. Diagrama de Blocos do Firmware
 
-![alt text](image.png)
+![alt text](image-3.png)
+
 
 ### Tasks
 
