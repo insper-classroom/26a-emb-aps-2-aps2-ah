@@ -28,12 +28,12 @@ O firmware roda em uma **Raspberry Pi Pico** com **FreeRTOS**, sem variáveis gl
 
 ### Imagens
 
-> *(adicionar imagens do protótipo aqui — proposta + montagem real)*
->
-> - `docs/proposta.png` — esboço/render da proposta inicial
-> - `docs/controle_real.jpg` — foto do controle montado
-> - `docs/jogando.gif` — gif jogando com o controle
 
+ideias: 
+
+![alt text](image-1.png)
+
+![alt text](image-2.png)
 ---
 
 ## 3. Entradas e Saídas
@@ -133,7 +133,8 @@ O **rate limiting** (20 eventos/s) e o **clamp de movimento** (±12 px) já são
 
 ## 5. Diagrama de Blocos do Firmware
 
-![alt text](image.png)
+![alt text](image-3.png)
+
 
 ### Tasks
 
