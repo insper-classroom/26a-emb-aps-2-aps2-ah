@@ -1,425 +1,192 @@
 /*
- * main.c — Controle Papers, Please com Bluetooth HC-06
- * APS 2 + Expert Bluetooth+RTOS - Computação Embarcada
- *
- * Arquitetura:
- *   imu_task       — lê MPU6050 e envia "M,dx,dy\n" via fila → HC-06
- *   btn_task       — consome fila de botões, envia "BD,n / BU,n\n" via HC-06
- *   tx_task        — consome xQueueTX e escreve bytes na UART do HC-06
- *   status_task    — monitora pino STATE do HC-06 e controla LED
- *   power_task     — botão liga/desliga, notifica tasks via xQueuePower
- *
- *   btn_callback (ISR) — enfileira eventos brutos em xQueueButtons
- *   uart_rx_handler(ISR) — recebe bytes do HC-06 (reservado para extensões)
- *
- * Protocolo serial (lido pelo controller.py no PC via COM Bluetooth):
- *   M,dx,dy    → movimento do mouse
- *   BD,n       → botão n pressionado
- *   BU,n       → botão n solto
- *     1=APPROVE(tecla A), 2=DENY(tecla X), 3=CLICK(mouse esq), 4=INSPECT(tecla I)
- *   PWR,1/0    → controle ligado/desligado
- *
- * Hardware HC-06:
- *   HC-06 STATE → GP3   (indica conexão BT: HIGH=conectado)
- *   HC-06 RXD   → GP4   (TX1 da Pico)
- *   HC-06 TXD   → GP5   (RX1 da Pico)
- *   HC-06 ENABLE→ GP6
- *   HC-06 VCC   → VBUS (5V)
- *   HC-06 GND   → GND
- *
- * Regras de qualidade:
- *   Rule 1.1/1.2/1.3 — Zero globais
- *   Rule 3.0-3.3      — ISR curta: sem delay, printf, for, display
- *   Rule 4.1-4.4      — FreeRTOS correto, sem globais de estado
+ * main.c (FIRMWARE DE TESTE - bare-metal, sem FreeRTOS)
  */
 
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include "pico/stdlib.h"
+#include "hardware/gpio.h"
 #include "hardware/i2c.h"
 #include "hardware/uart.h"
-#include "hardware/gpio.h"
-#include "hardware/irq.h"
 
-#include "FreeRTOS.h"
-#include "task.h"
-#include "queue.h"
-#include "semphr.h"
+#define BTN_APPROVE   13
+#define BTN_DENY      15
+#define BTN_CLICK     14
+#define BTN_INSPECT   12
+#define BTN_POWER     11
 
-/* ── UART HC-06 ─────────────────────────────────────────────── */
-#define HC06_UART_ID    uart1
-#define HC06_BAUD_RATE  9600
-#define HC06_TX_PIN     4     /* GP4 = UART1 TX */
-#define HC06_RX_PIN     5     /* GP5 = UART1 RX */
-#define HC06_EN_PIN     6
-#define HC06_STATE_PIN  3     /* HIGH = BT conectado */
-#define HC06_NAME       "PapersPlease-Ctrl"
-#define HC06_PIN_BT     "1234"
+#define LED_PIN       17
+#define LED_CALIBRADO 16
 
-/* ── IMU ────────────────────────────────────────────────────── */
-#define I2C_PORT            i2c0
-#define I2C_SDA_PIN         8
-#define I2C_SCL_PIN         9
-#define MPU6050_ADDR        0x68
-#define MPU6050_PWR_MGMT_1  0x6B
-#define MPU6050_GYRO_XOUT_H 0x43
-#define GYRO_DEADZONE       10
-#define MAX_MOUSE_SPEED     12
-#define CALIBRATION_SAMPLES 3000
+#define I2C_PORT      i2c0
+#define I2C_SDA       8
+#define I2C_SCL       9
+#define MPU_ADDR      0x68
 
-/* ── BOTÕES ─────────────────────────────────────────────────── */
-#define BTN_APPROVE_PIN  16
-#define BTN_DENY_PIN     17
-#define BTN_CLICK_PIN    18
-#define BTN_INSPECT_PIN  19
-#define BTN_POWER_PIN    20
-#define LED_STATUS_PIN   25
-#define NUM_BTNS         4
+#define HC06_UART     uart1
+#define HC06_TX       4
+#define HC06_RX       5
+#define HC06_STATE    3
+#define HC06_BAUD     9600
 
-/* ── ANTI-CHEAT ─────────────────────────────────────────────── */
-#define DEBOUNCE_MS          50
-#define MAX_BTN_EVENTS_PER_S 20
-#define RATE_LIMIT_PERIOD_MS 1000
+#define CALIB_SAMPLES 200
 
-/* ── TIPOS ──────────────────────────────────────────────────── */
-typedef struct {
-    uint8_t  pin;
-    uint8_t  state;
-    uint32_t time_ms;
-} button_event_t;
+const uint button_pins[] = {BTN_APPROVE, BTN_DENY, BTN_CLICK, BTN_INSPECT, BTN_POWER};
+const char *button_names[] = {"APPROVE", "DENY", "CLICK", "INSPECT", "POWER"};
+#define NUM_BUTTONS (sizeof(button_pins) / sizeof(button_pins[0]))
 
-typedef enum { PWR_ON, PWR_OFF } power_event_t;
+bool button_last[NUM_BUTTONS];
 
-/* ── RECURSOS RTOS ──────────────────────────────────────────── */
-static QueueHandle_t     xQueueButtons;  /* ISR → btn_task        */
-static QueueHandle_t     xQueueTX;       /* tasks → tx_task       */
-static QueueHandle_t     xQueuePower;    /* power_task → outras   */
-static SemaphoreHandle_t xRateSem;       /* anti-cheat rate limit */
+int32_t gyro_offset_x = 0;
+int32_t gyro_offset_y = 0;
+int32_t gyro_offset_z = 0;
+bool gyro_calibrated = false;
 
-/* ── HELPERS ────────────────────────────────────────────────── */
-static inline int pin_to_idx(uint8_t pin) {
-    switch (pin) {
-        case BTN_APPROVE_PIN: return 0;
-        case BTN_DENY_PIN:    return 1;
-        case BTN_CLICK_PIN:   return 2;
-        case BTN_INSPECT_PIN: return 3;
-        default:              return -1;
-    }
+void mpu6050_write(uint8_t reg, uint8_t value) {
+    uint8_t buf[2] = {reg, value};
+    i2c_write_blocking(I2C_PORT, MPU_ADDR, buf, 2, false);
 }
 
-/* ── HC-06 CONFIG (comandos AT) ─────────────────────────────── */
-static void hc06_send_at(const char *cmd) {
-    uart_puts(HC06_UART_ID, cmd);
-    vTaskDelay(pdMS_TO_TICKS(500));
+void mpu6050_read(uint8_t reg, uint8_t *buf, uint8_t len) {
+    i2c_write_blocking(I2C_PORT, MPU_ADDR, &reg, 1, true);
+    i2c_read_blocking(I2C_PORT, MPU_ADDR, buf, len, false);
 }
 
-static void hc06_config(void) {
-    /* Coloca em modo AT: EN=HIGH, aguarda */
-    gpio_put(HC06_EN_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    hc06_send_at("AT");                              /* ping            */
-    hc06_send_at("AT+BAUD4");                        /* 9600 baud       */
-    hc06_send_at("AT+NAME" HC06_NAME);               /* nome BT         */
-    hc06_send_at("AT+PIN" HC06_PIN_BT);              /* PIN de pareamento */
-
-    /* Volta modo normal */
-    gpio_put(HC06_EN_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(200));
+void mpu6050_init(void) {
+    mpu6050_write(0x6B, 0x00);
 }
 
-/* ── MPU6050 ────────────────────────────────────────────────── */
-static void mpu6050_init(void) {
-    uint8_t buf[2] = {MPU6050_PWR_MGMT_1, 0x00};
-    i2c_write_blocking(I2C_PORT, MPU6050_ADDR, buf, 2, false);
-}
-
-static void mpu6050_read_gyro(int16_t gyro[3]) {
-    uint8_t buffer[6];
-    uint8_t reg = MPU6050_GYRO_XOUT_H;
-    i2c_write_blocking(I2C_PORT, MPU6050_ADDR, &reg, 1, true);
-    i2c_read_blocking(I2C_PORT, MPU6050_ADDR, buffer, 6, false);
-    gyro[0] = (int16_t)((buffer[0] << 8) | buffer[1]);
-    gyro[1] = (int16_t)((buffer[2] << 8) | buffer[3]);
-    gyro[2] = (int16_t)((buffer[4] << 8) | buffer[5]);
-}
-
-/* ── ISR: UART RX do HC-06 (reservado para extensões) ──────── */
-static void uart_rx_handler(void) {
-    /* Descarta bytes recebidos por enquanto */
-    while (uart_is_readable(HC06_UART_ID)) {
-        uart_getc(HC06_UART_ID);
-    }
-}
-
-/* ── ISR: botões (Rule 3.0-3.3, Rule 4.1) ──────────────────── */
-static void btn_callback(uint gpio, uint32_t events) {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-
-    /* Rate limiting via semáforo — Rule 4.1 */
-    if (xSemaphoreTakeFromISR(xRateSem, &xHigherPriorityTaskWoken) == pdFALSE) {
-        return;
-    }
-
-    button_event_t event;
-    event.pin     = (uint8_t)gpio;
-    event.state   = (events & GPIO_IRQ_EDGE_FALL) ? 1U : 0U;
-    event.time_ms = to_ms_since_boot(get_absolute_time());
-
-    xQueueSendFromISR(xQueueButtons, &event, &xHigherPriorityTaskWoken);
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-}
-
-/* ── TASK: TX — envia bytes da fila para HC-06 via UART ─────── */
-static void tx_task(void *pvParameters) {
-    (void)pvParameters;
-    uint8_t byte;
-    while (1) {
-        if (xQueueReceive(xQueueTX, &byte, portMAX_DELAY) == pdPASS) {
-            uart_putc_raw(HC06_UART_ID, (char)byte);
+void calibrate_gyro(void) {
+    printf("[CALIB] Iniciando calibracao... mantenha o controle PARADO.\n");
+    int32_t sum_x = 0, sum_y = 0, sum_z = 0;
+    for (int i = 0; i < CALIB_SAMPLES; i++) {
+        uint8_t buf[6];
+        mpu6050_read(0x43, buf, 6);
+        sum_x += (int16_t)((buf[0] << 8) | buf[1]);
+        sum_y += (int16_t)((buf[2] << 8) | buf[3]);
+        sum_z += (int16_t)((buf[4] << 8) | buf[5]);
+        if (i % 20 == 0) {
+            gpio_put(LED_CALIBRADO, !gpio_get(LED_CALIBRADO));
         }
+        sleep_ms(5);
+    }
+    gyro_offset_x = sum_x / CALIB_SAMPLES;
+    gyro_offset_y = sum_y / CALIB_SAMPLES;
+    gyro_offset_z = sum_z / CALIB_SAMPLES;
+    gyro_calibrated = true;
+    gpio_put(LED_CALIBRADO, 1);
+    printf("[CALIB] Concluida! Offsets -> x=%d  y=%d  z=%d\n",
+           (int)gyro_offset_x, (int)gyro_offset_y, (int)gyro_offset_z);
+}
+
+void setup_buttons(void) {
+    for (int i = 0; i < NUM_BUTTONS; i++) {
+        gpio_init(button_pins[i]);
+        gpio_set_dir(button_pins[i], GPIO_IN);
+        gpio_pull_up(button_pins[i]);
+        button_last[i] = true;
     }
 }
 
-/* ── HELPER: envia string para xQueueTX byte a byte ─────────── */
-static void bt_send(const char *str) {
-    while (*str) {
-        uint8_t b = (uint8_t)(*str++);
-        xQueueSend(xQueueTX, &b, portMAX_DELAY);
-    }
+void setup_led(void) {
+    gpio_init(LED_PIN);
+    gpio_set_dir(LED_PIN, GPIO_OUT);
+    gpio_put(LED_PIN, 0);
+    gpio_init(LED_CALIBRADO);
+    gpio_set_dir(LED_CALIBRADO, GPIO_OUT);
+    gpio_put(LED_CALIBRADO, 0);
 }
 
-/* ── TASK: Rate limiter — recarrega semáforo a cada 1s ──────── */
-static void rate_reset_task(void *pvParameters) {
-    (void)pvParameters;
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(RATE_LIMIT_PERIOD_MS));
-        for (int i = 0; i < MAX_BTN_EVENTS_PER_S; i++) {
-            xSemaphoreGive(xRateSem);
-        }
-    }
-}
-
-/* ── TASK: IMU → BT ─────────────────────────────────────────── */
-static void imu_task(void *pvParameters) {
-    (void)pvParameters;
-
+void setup_i2c(void) {
     i2c_init(I2C_PORT, 400 * 1000);
-    gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
-    gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C_SDA_PIN);
-    gpio_pull_up(I2C_SCL_PIN);
-    mpu6050_init();
+    gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SDA);
+    gpio_pull_up(I2C_SCL);
+}
 
-    /* Calibração igual ao Enzo */
-    int32_t gyro_x_offset = 0;
-    int32_t gyro_y_offset = 0;
-    int16_t gyro[3];
+void setup_hc06(void) {
+    uart_init(HC06_UART, HC06_BAUD);
+    gpio_set_function(HC06_TX, GPIO_FUNC_UART);
+    gpio_set_function(HC06_RX, GPIO_FUNC_UART);
+    gpio_init(HC06_STATE);
+    gpio_set_dir(HC06_STATE, GPIO_IN);
+}
 
-    for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
-        mpu6050_read_gyro(gyro);
-        gyro_x_offset += gyro[0];
-        gyro_y_offset += gyro[1];
-        vTaskDelay(pdMS_TO_TICKS(2));
-    }
-    gyro_x_offset /= CALIBRATION_SAMPLES;
-    gyro_y_offset /= CALIBRATION_SAMPLES;
-
-    bool controller_on = false;
-    power_event_t pwr_event;
-    char buf[32];
-
-    while (1) {
-        if (xQueueReceive(xQueuePower, &pwr_event, 0) == pdPASS) {
-            controller_on = (pwr_event == PWR_ON);
-        }
-
-        if (!controller_on) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-
-        mpu6050_read_gyro(gyro);
-
-        int16_t corrected_gx = gyro[0] - (int16_t)gyro_x_offset;
-        int16_t corrected_gy = gyro[1] - (int16_t)gyro_y_offset;
-
-        int16_t mouse_dx = -corrected_gy / 100;
-        int16_t mouse_dy = -corrected_gx / 100;
-
-        if (abs(corrected_gy) < GYRO_DEADZONE) mouse_dx = 0;
-        if (abs(corrected_gx) < GYRO_DEADZONE) mouse_dy = 0;
-
-        /* Clamp anti-cheat */
-        if (mouse_dx >  MAX_MOUSE_SPEED) mouse_dx =  MAX_MOUSE_SPEED;
-        if (mouse_dx < -MAX_MOUSE_SPEED) mouse_dx = -MAX_MOUSE_SPEED;
-        if (mouse_dy >  MAX_MOUSE_SPEED) mouse_dy =  MAX_MOUSE_SPEED;
-        if (mouse_dy < -MAX_MOUSE_SPEED) mouse_dy = -MAX_MOUSE_SPEED;
-
-        if (mouse_dx != 0 || mouse_dy != 0) {
-            snprintf(buf, sizeof(buf), "M,%d,%d\n", mouse_dx, -mouse_dy);
-            bt_send(buf);
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10));
+void test_mpu6050(void) {
+    uint8_t who = 0;
+    mpu6050_read(0x75, &who, 1);
+    printf("[MPU6050] WHO_AM_I = 0x%02X ", who);
+    if (who == 0x68) {
+        printf("-> OK! Sensor respondendo.\n");
+    } else {
+        printf("-> ERRO! Esperado 0x68.\n");
     }
 }
 
-/* ── TASK: Botões → BT ──────────────────────────────────────── */
-static void btn_task(void *pvParameters) {
-    (void)pvParameters;
-
-    const uint8_t BTN_PINS[NUM_BTNS] = {
-        BTN_APPROVE_PIN, BTN_DENY_PIN,
-        BTN_CLICK_PIN,   BTN_INSPECT_PIN
-    };
-
-    for (int i = 0; i < NUM_BTNS; i++) {
-        gpio_init(BTN_PINS[i]);
-        gpio_set_dir(BTN_PINS[i], GPIO_IN);
-        gpio_pull_up(BTN_PINS[i]);
-        gpio_set_irq_enabled_with_callback(
-            BTN_PINS[i],
-            GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE,
-            true, &btn_callback
-        );
-    }
-
-    /* Timestamps de debounce locais — sem global, Rule 4.4 */
-    uint32_t last_event_ms[NUM_BTNS] = {0U, 0U, 0U, 0U};
-
-    bool controller_on = false;
-    button_event_t ev;
-    power_event_t pwr_event;
-    char buf[16];
-
-    while (1) {
-        if (xQueueReceive(xQueuePower, &pwr_event, 0) == pdPASS) {
-            controller_on = (pwr_event == PWR_ON);
-        }
-
-        if (xQueueReceive(xQueueButtons, &ev, pdMS_TO_TICKS(10)) != pdPASS) {
-            continue;
-        }
-
-        /* Debounce na task — sem global */
-        int idx = pin_to_idx(ev.pin);
-        if (idx < 0) continue;
-        if ((ev.time_ms - last_event_ms[idx]) < DEBOUNCE_MS) continue;
-        last_event_ms[idx] = ev.time_ms;
-
-        if (!controller_on) continue;
-
-        uint8_t btn_id = 0;
-        switch (ev.pin) {
-            case BTN_APPROVE_PIN: btn_id = 1; break;
-            case BTN_DENY_PIN:    btn_id = 2; break;
-            case BTN_CLICK_PIN:   btn_id = 3; break;
-            case BTN_INSPECT_PIN: btn_id = 4; break;
-            default: break;
-        }
-
-        if (btn_id != 0) {
-            snprintf(buf, sizeof(buf),
-                     ev.state ? "BD,%d\n" : "BU,%d\n", btn_id);
-            bt_send(buf);
-        }
-    }
+void read_gyro(void) {
+    uint8_t ax_h, ax_l, ay_h, ay_l, az_h, az_l;
+    mpu6050_read(0x3B, &ax_h, 1);
+    mpu6050_read(0x3C, &ax_l, 1);
+    mpu6050_read(0x3D, &ay_h, 1);
+    mpu6050_read(0x3E, &ay_l, 1);
+    mpu6050_read(0x3F, &az_h, 1);
+    mpu6050_read(0x40, &az_l, 1);
+    int16_t ax = (int16_t)((ax_h << 8) | ax_l);
+    int16_t ay = (int16_t)((ay_h << 8) | ay_l);
+    int16_t az = (int16_t)((az_h << 8) | az_l);
+    printf("[ACC] x=%6d  y=%6d  z=%6d\n", ax, ay, az);
 }
 
-/* ── TASK: Power + LED controlado pelo STATE do HC-06 ───────── */
-static void power_task(void *pvParameters) {
-    (void)pvParameters;
-
-    gpio_init(BTN_POWER_PIN);
-    gpio_set_dir(BTN_POWER_PIN, GPIO_IN);
-    gpio_pull_up(BTN_POWER_PIN);
-
-    /* LED controlado pelo STATE do HC-06 */
-    gpio_init(LED_STATUS_PIN);
-    gpio_set_dir(LED_STATUS_PIN, GPIO_OUT);
-    gpio_put(LED_STATUS_PIN, 0);
-
-    /* Pino STATE do HC-06 como entrada */
-    gpio_init(HC06_STATE_PIN);
-    gpio_set_dir(HC06_STATE_PIN, GPIO_IN);
-
-    bool last_btn_state = true;
-    bool controller_on  = false;
-    TickType_t last_press = 0;
-    char buf[16];
-
-    while (1) {
-        /* LED = STATE do HC-06 (HIGH = BT conectado) */
-        gpio_put(LED_STATUS_PIN, gpio_get(HC06_STATE_PIN) ? 1 : 0);
-
-        /* Botão power com debounce */
-        bool current = gpio_get(BTN_POWER_PIN);
-        if (!current && last_btn_state) {
-            TickType_t now = xTaskGetTickCount();
-            if ((now - last_press) > pdMS_TO_TICKS(300)) {
-                controller_on = !controller_on;
-
-                power_event_t pwr = controller_on ? PWR_ON : PWR_OFF;
-                xQueueOverwrite(xQueuePower, &pwr);
-
-                snprintf(buf, sizeof(buf), "PWR,%d\n", controller_on ? 1 : 0);
-                bt_send(buf);
-
-                last_press = now;
-            }
-        }
-        last_btn_state = current;
-
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-}
-
-/* ── TASK: Inicialização do HC-06 ───────────────────────────── */
-static void init_task(void *pvParameters) {
-    (void)pvParameters;
-
-    /* Configura UART do HC-06 */
-    uart_init(HC06_UART_ID, HC06_BAUD_RATE);
-    gpio_set_function(HC06_TX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(HC06_RX_PIN, GPIO_FUNC_UART);
-
-    gpio_init(HC06_EN_PIN);
-    gpio_set_dir(HC06_EN_PIN, GPIO_OUT);
-    gpio_put(HC06_EN_PIN, 0);
-
-    /* Instala IRQ de RX */
-    irq_set_exclusive_handler(UART1_IRQ, uart_rx_handler);
-    irq_set_enabled(UART1_IRQ, true);
-    uart_set_irq_enables(HC06_UART_ID, true, false);
-
-    /* Configura nome e PIN do HC-06 */
-    hc06_config();
-
-    /* Tarefa de inicialização se encerra */
-    vTaskDelete(NULL);
-}
-
-/* ── MAIN ───────────────────────────────────────────────────── */
 int main(void) {
     stdio_init_all();
+    sleep_ms(3000);
 
-    /* Inicializa todos os recursos RTOS no main — Rule 4.4 */
-    xQueueButtons = xQueueCreate(20, sizeof(button_event_t));
-    xQueueTX      = xQueueCreate(128, sizeof(uint8_t));
-    xQueuePower   = xQueueCreate(1, sizeof(power_event_t));
-    xRateSem      = xSemaphoreCreateCounting(MAX_BTN_EVENTS_PER_S,
-                                              MAX_BTN_EVENTS_PER_S);
+    printf("\n=== TESTE DE HARDWARE - Controle Papers Please ===\n");
 
-    /* init_task com prioridade máxima para configurar HC-06 antes */
-    xTaskCreate(init_task,       "InitTask",     512, NULL, 4, NULL);
-    xTaskCreate(tx_task,         "TXTask",       256, NULL, 3, NULL);
-    xTaskCreate(imu_task,        "IMUTask",      512, NULL, 1, NULL);
-    xTaskCreate(btn_task,        "BtnTask",      256, NULL, 1, NULL);
-    xTaskCreate(power_task,      "PwrTask",      256, NULL, 2, NULL);
-    xTaskCreate(rate_reset_task, "RateRstTask",  128, NULL, 2, NULL);
+    setup_buttons();
+    setup_led();
+    setup_i2c();
+    setup_hc06();
 
-    vTaskStartScheduler();
-    while (1);
+    mpu6050_init();
+    test_mpu6050();
+    calibrate_gyro();
+
+    uart_puts(HC06_UART, "HC06 OK\n");
+    printf("[HC-06] Enviei 'HC06 OK' pela UART1.\n");
+    printf("[HC-06] STATE atual = %d\n", gpio_get(HC06_STATE));
+
+    uint32_t last_gyro = 0;
+
+    while (true) {
+        for (int i = 0; i < NUM_BUTTONS; i++) {
+            bool pressed = !gpio_get(button_pins[i]);
+            if (pressed != !button_last[i]) {
+                if (pressed) {
+                    printf("[BOTAO] %s pressionado\n", button_names[i]);
+                } else {
+                    printf("[BOTAO] %s solto\n", button_names[i]);
+                }
+                button_last[i] = !pressed;
+            }
+        }
+
+        gpio_put(LED_PIN, !gpio_get(BTN_APPROVE));
+
+        if (uart_is_readable(HC06_UART)) {
+            char c = uart_getc(HC06_UART);
+            printf("[HC-06] recebeu: '%c'\n", c);
+        }
+
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        if (now - last_gyro >= 1000) {
+            read_gyro();
+            uart_puts(HC06_UART, "TESTE,123\n");   // <<< LINHA DE TESTE: manda pelo Bluetooth 1x/s
+            printf("[HC-06] STATE = %d\n", gpio_get(HC06_STATE));
+            last_gyro = now;
+        }
+
+        sleep_ms(10);
+    }
+    return 0;
 }
