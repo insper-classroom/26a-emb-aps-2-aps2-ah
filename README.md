@@ -1,6 +1,6 @@
 # Controle Customizado — Papers, Please
 
-**APS 2 + Expert (Bluetooth + RTOS) | Computação Embarcada — Insper**
+**APS 2 + Expert (Bluetooth + IA) | Computação Embarcada — Insper**
 
 ---
 
