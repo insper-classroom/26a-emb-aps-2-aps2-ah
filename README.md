@@ -21,13 +21,13 @@ As ações principais do jogo são:
 ---
 ##  2. Ideia do Controle
 
-O controle é um dispositivo físico sem fio que substitui o teclado e o mouse para jogar Papers, Please. A intenção é que o jogo seja jogado da forma mais imersiva possível: o jogador segura o controle como se fosse a prancheta do inspetor, inclina o controle para mover o cursor (via IMU/giroscópio) e pressiona botões físicos dedicados para os carimbos e ações.
+O controle é um dispositivo físico com fio que substitui o teclado e o mouse para jogar Papers, Please. A intenção é que o jogo seja jogado da forma mais imersiva possível: o jogador segura o controle como se fosse a prancheta do inspetor, inclina o controle para mover o cursor (via IMU/giroscópio) e pressiona botões físicos dedicados para os carimbos e ações.
 
-Os dois botões principais — **APPROVE** (verde) e **DENY** (vermelho) — imitam os carimbos físicos do jogo, tornando a experiência intuitiva e temática. O botão **CLICK** permite arrastar e soltar documentos na mesa, e o botão **INSPECT** aciona interrogação ou revista.
+Os dois botões principais — APPROVE (verde) e DENY (vermelho) — imitam os carimbos físicos do jogo, tornando a experiência intuitiva e temática. O botão CLICK permite arrastar e soltar documentos na mesa, e o botão INSPECT aciona interrogação ou revista.
 
-O controle se comunica com o PC via **Bluetooth (HC-06)**, sendo completamente sem fio. Um script Python no computador escuta as mensagens do controle e as traduz em eventos reais de teclado e mouse no sistema operacional.
+O controle se comunica com o PC via USB (UART), com um script Python no computador escutando as mensagens do controle e as traduzindo em eventos reais de teclado e mouse no sistema operacional.
 
-O firmware roda em uma **Raspberry Pi Pico** com **FreeRTOS**, sem variáveis globais de estado — toda comunicação entre tasks é feita via filas e semáforos.
+O módulo de IA embarcada é utilizado para detectar gestos específicos de movimento da IMU — como um gesto de "carimbar" (movimento brusco para baixo) — disparando automaticamente as ações de APPROVE ou DENY sem precisar pressionar botão.
 
 ---
 
@@ -66,15 +66,6 @@ ideias:
 | LED de status | Digital | Aceso = Bluetooth conectado ao PC; apagado = desconectado |
 | HC-06 (UART TX) | Serial sem fio | Envia eventos do controle para o PC |
 | HC-06 ENABLE | Digital | Habilita modo AT para configuração no boot |
-
-### Módulo Bluetooth (HC-06)
-
-| Pino HC-06 | Pino Pico | Direção | Função |
-|---|---|---|---|
-| STATE | GP3 | Entrada | HIGH = BT conectado ao PC (controla o LED) |
-| RXD | GP4 (UART1 TX) | Saída | Recebe dados da Pico |
-| TXD | GP5 (UART1 RX) | Entrada | Envia dados para a Pico |
-| ENABLE | GP6 | Saída | Habilita modo AT |
 
 ---
 
