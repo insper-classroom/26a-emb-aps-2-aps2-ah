@@ -17,6 +17,11 @@
  * https://github.com/insper-embarcados/edgeimpulse-runner
  */
 
+/*
+ * main.c — Controle Papers, Please
+ * APS 2 + Expert (IA + RTOS) | Computação Embarcada — Insper
+ */
+
 #include <stdio.h>
 #include <string.h>
 
@@ -35,10 +40,7 @@
 #include "edge-impulse-sdk/classifier/ei_run_classifier.h"
 #endif
 
-/* ══════════════════════════════════════════════════════════════════════════ *
- *  CONSTANTES DE HARDWARE
- * ══════════════════════════════════════════════════════════════════════════ */
-
+/* ===== HARDWARE ===== */
 #define BTN_APPROVE   13
 #define BTN_DENY      15
 #define BTN_CLICK     14
@@ -64,22 +66,16 @@
 #define MPU_REG_WHO_AM_I  0x75
 #define MPU_WHO_AM_I_VAL  0x68
 
-/* ══════════════════════════════════════════════════════════════════════════ *
- *  PARÂMETROS DE OPERAÇÃO
- * ══════════════════════════════════════════════════════════════════════════ */
-
+/* ===== PARAMETROS ===== */
 #define CALIB_SAMPLES  200
 #define MOUSE_DIVISOR  (32768 / 12)
 #define MOUSE_CLAMP    12
 #define RATE_LIMIT_HZ  20
 #define DEBOUNCE_MS    50
-#define IA_WINDOW_SIZE 50
+#define IA_WINDOW_SIZE 166   /* = EI_CLASSIFIER_RAW_SAMPLE_COUNT */
 #define IA_N_AXES      3
 
-/* ══════════════════════════════════════════════════════════════════════════ *
- *  TIPOS
- * ══════════════════════════════════════════════════════════════════════════ */
-
+/* ===== TIPOS ===== */
 typedef struct {
     uint8_t  pin;
     bool     pressed;
@@ -92,29 +88,20 @@ typedef struct {
     float az;
 } imu_sample_t;
 
-/* Parâmetros passados às tasks via xTaskCreate */
 typedef struct {
     QueueHandle_t     queue_tx;
     QueueHandle_t     queue_power;
     QueueHandle_t     queue_imu;
     QueueHandle_t     queue_buttons;
     SemaphoreHandle_t sem_rate;
-    int32_t           gyro_offsets[3];  /* [0]=gx [1]=gy [2]=gz */
+    int32_t           gyro_offsets[3];
 } task_params_t;
 
-/* ══════════════════════════════════════════════════════════════════════════ *
- *  VARIÁVEIS GLOBAIS
- *  Rule 1.1/1.2/1.3 — somente as acessadas pela ISR, com volatile
- *  Rule 4.4          — não são filas de RTOS; são os handles que a ISR usa
- * ══════════════════════════════════════════════════════════════════════════ */
-
+/* ===== GLOBAIS (somente ISR, volatile) ===== */
 static volatile QueueHandle_t     g_isr_queue_buttons;
 static volatile SemaphoreHandle_t g_isr_sem_rate;
 
-/* ══════════════════════════════════════════════════════════════════════════ *
- *  DRIVER MPU6050
- * ══════════════════════════════════════════════════════════════════════════ */
-
+/* ===== DRIVER MPU6050 ===== */
 static void mpu_write(uint8_t reg, uint8_t val) {
     uint8_t buf[2] = {reg, val};
     i2c_write_blocking(I2C_PORT, MPU_ADDR, buf, 2, false);
@@ -147,10 +134,7 @@ static void mpu_read_gyro(int16_t *gx, int16_t *gy, int16_t *gz) {
     *gz = (int16_t)((buf[4] << 8) | buf[5]);
 }
 
-/* ══════════════════════════════════════════════════════════════════════════ *
- *  UTILITÁRIOS
- * ══════════════════════════════════════════════════════════════════════════ */
-
+/* ===== UTILITARIOS ===== */
 static void tx_send(QueueHandle_t queue_tx, const char *s) {
     while (*s != '\0') {
         xQueueSend(queue_tx, s, portMAX_DELAY);
@@ -164,13 +148,7 @@ static int clamp_val(int val, int lo, int hi) {
     return val;
 }
 
-/* ══════════════════════════════════════════════════════════════════════════ *
- *  ISR — btn_callback
- *  Rule 3.0 — sem delay
- *  Rule 3.2 — sem printf/sprintf
- *  Rule 3.3 — sem laços
- * ══════════════════════════════════════════════════════════════════════════ */
-
+/* ===== ISR ===== */
 static void btn_callback(uint gpio, uint32_t events) {
     (void)events;
     BaseType_t higher_woken = pdFALSE;
@@ -188,15 +166,7 @@ static void btn_callback(uint gpio, uint32_t events) {
     portYIELD_FROM_ISR(higher_woken);
 }
 
-/* ══════════════════════════════════════════════════════════════════════════ *
- *  TASKS
- * ══════════════════════════════════════════════════════════════════════════ */
-
-/* --------------------------------------------------------------------------
- * init_task (prio 4)
- * Inicializa I2C e MPU6050, calibra giroscópio, grava offsets em params.
- * Auto-deleta ao final.
- * -------------------------------------------------------------------------- */
+/* ===== TASKS ===== */
 static void init_task(void *pvParams) {
     task_params_t *p = (task_params_t *)pvParams;
 
@@ -245,9 +215,6 @@ static void init_task(void *pvParams) {
     vTaskDelete(NULL);
 }
 
-/* --------------------------------------------------------------------------
- * tx_task (prio 3)
- * -------------------------------------------------------------------------- */
 static void tx_task(void *pvParams) {
     task_params_t *p = (task_params_t *)pvParams;
     char c = '\0';
@@ -258,9 +225,6 @@ static void tx_task(void *pvParams) {
     }
 }
 
-/* --------------------------------------------------------------------------
- * power_task (prio 2)
- * -------------------------------------------------------------------------- */
 static void power_task(void *pvParams) {
     task_params_t *p = (task_params_t *)pvParams;
     bool ligado   = false;
@@ -284,9 +248,6 @@ static void power_task(void *pvParams) {
     }
 }
 
-/* --------------------------------------------------------------------------
- * rate_reset_task (prio 2)
- * -------------------------------------------------------------------------- */
 static void rate_reset_task(void *pvParams) {
     task_params_t *p = (task_params_t *)pvParams;
 
@@ -298,15 +259,11 @@ static void rate_reset_task(void *pvParams) {
     }
 }
 
-/* --------------------------------------------------------------------------
- * imu_task (prio 1)
- * -------------------------------------------------------------------------- */
 static void imu_task(void *pvParams) {
     task_params_t *p = (task_params_t *)pvParams;
     bool ligado = false;
     char msg[24];
 
-    /* Aguarda calibração terminar (LED_CALIBRADO acende) */
     while (!gpio_get(LED_CALIBRADO)) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -358,9 +315,6 @@ static void imu_task(void *pvParams) {
     }
 }
 
-/* --------------------------------------------------------------------------
- * btn_task (prio 1)
- * -------------------------------------------------------------------------- */
 static void btn_task(void *pvParams) {
     task_params_t *p = (task_params_t *)pvParams;
 
@@ -406,9 +360,6 @@ static void btn_task(void *pvParams) {
     }
 }
 
-/* --------------------------------------------------------------------------
- * ia_task (prio 1)
- * -------------------------------------------------------------------------- */
 static void ia_task(void *pvParams) {
     task_params_t *p = (task_params_t *)pvParams;
     static imu_sample_t window[IA_WINDOW_SIZE];
@@ -459,7 +410,6 @@ static void ia_task(void *pvParams) {
         gpio_put(LED_IA_IDLE,   (strcmp(label, "idle")   == 0) ? 1 : 0);
         gpio_put(LED_IA_UPDOWN, (strcmp(label, "updown") == 0) ? 1 : 0);
         gpio_put(LED_IA_WAVE,   (strcmp(label, "wave")   == 0) ? 1 : 0);
-
 #else
         printf("[IA] stub ax=%.2f ay=%.2f az=%.2f\n",
                (double)window[0].ax,
@@ -469,17 +419,13 @@ static void ia_task(void *pvParams) {
     }
 }
 
-/* ══════════════════════════════════════════════════════════════════════════ *
- *  MAIN
- * ══════════════════════════════════════════════════════════════════════════ */
-
+/* ===== MAIN ===== */
 int main(void) {
     stdio_init_all();
     sleep_ms(2000);
 
     printf("\n=== Controle Papers, Please - APS2 ===\n");
 
-    /* Botões de ação com IRQ */
     static const uint ACTION_BTNS[4] = {
         BTN_APPROVE, BTN_DENY, BTN_CLICK, BTN_INSPECT
     };
@@ -491,12 +437,10 @@ int main(void) {
             GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, btn_callback);
     }
 
-    /* Botão POWER */
     gpio_init(BTN_POWER);
     gpio_set_dir(BTN_POWER, GPIO_IN);
     gpio_pull_up(BTN_POWER);
 
-    /* LEDs */
     static const uint LEDS[5] = {
         LED_STATUS, LED_CALIBRADO, LED_IA_IDLE, LED_IA_UPDOWN, LED_IA_WAVE
     };
@@ -506,7 +450,6 @@ int main(void) {
         gpio_put(LEDS[i], 0);
     }
 
-    /* Struct de parâmetros compartilhada entre todas as tasks */
     static task_params_t params;
     params.gyro_offsets[0] = 0;
     params.gyro_offsets[1] = 0;
@@ -518,11 +461,9 @@ int main(void) {
     params.queue_imu     = xQueueCreate(2,   IA_WINDOW_SIZE * sizeof(imu_sample_t));
     params.sem_rate      = xSemaphoreCreateCounting(RATE_LIMIT_HZ, RATE_LIMIT_HZ);
 
-    /* Expõe apenas os handles que a ISR precisa, via globais volatile */
     g_isr_queue_buttons = params.queue_buttons;
     g_isr_sem_rate      = params.sem_rate;
 
-    /* Estado inicial: controle desligado */
     bool off = false;
     xQueueSend(params.queue_power, &off, 0);
 
