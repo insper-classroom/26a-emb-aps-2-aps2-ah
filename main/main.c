@@ -1,12 +1,18 @@
 /*
- * main.c (FIRMWARE DE TESTE - bare-metal, sem FreeRTOS)
+ * main.c — Passo 6: power_task (liga/desliga) + LED de status
  */
 
 #include <stdio.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/i2c.h"
-#include "hardware/uart.h"
+
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+
+#define LED_STATUS    16   /* aceso = controle ligado */
 
 #define BTN_APPROVE   13
 #define BTN_DENY      15
@@ -14,33 +20,42 @@
 #define BTN_INSPECT   12
 #define BTN_POWER     11
 
-#define LED_PIN       17
-#define LED_CALIBRADO 16
-
 #define I2C_PORT      i2c0
 #define I2C_SDA       8
 #define I2C_SCL       9
 #define MPU_ADDR      0x68
 
-#define HC06_UART     uart1
-#define HC06_TX       4
-#define HC06_RX       5
-#define HC06_STATE    3
-#define HC06_BAUD     9600
+#define DEBOUNCE_MS   50
 
-#define CALIB_SAMPLES 200
+const uint action_pins[] = {BTN_APPROVE, BTN_DENY, BTN_CLICK, BTN_INSPECT};
+#define NUM_ACTIONS 4
 
-const uint button_pins[] = {BTN_APPROVE, BTN_DENY, BTN_CLICK, BTN_INSPECT, BTN_POWER};
-const char *button_names[] = {"APPROVE", "DENY", "CLICK", "INSPECT", "POWER"};
-#define NUM_BUTTONS (sizeof(button_pins) / sizeof(button_pins[0]))
+/* Filas */
+QueueHandle_t xQueueTX;
+QueueHandle_t xQueueButtons;
+QueueHandle_t xQueuePower;   /* estado liga/desliga (1 slot, overwrite) */
 
-bool button_last[NUM_BUTTONS];
+typedef struct {
+    uint8_t  pin;
+    bool     pressed;
+    uint32_t ts_ms;
+} btn_event_t;
 
-int32_t gyro_offset_x = 0;
-int32_t gyro_offset_y = 0;
-int32_t gyro_offset_z = 0;
-bool gyro_calibrated = false;
+void tx_send(const char *s) {
+    while (*s != '\0') {
+        xQueueSend(xQueueTX, s, portMAX_DELAY);
+        s++;
+    }
+}
 
+/* Le o estado atual de power (sem remover da fila) */
+bool power_is_on(void) {
+    bool on = false;
+    xQueuePeek(xQueuePower, &on, 0);
+    return on;
+}
+
+/* ===== MPU6050 ===== */
 void mpu6050_write(uint8_t reg, uint8_t value) {
     uint8_t buf[2] = {reg, value};
     i2c_write_blocking(I2C_PORT, MPU_ADDR, buf, 2, false);
@@ -51,142 +66,173 @@ void mpu6050_read(uint8_t reg, uint8_t *buf, uint8_t len) {
     i2c_read_blocking(I2C_PORT, MPU_ADDR, buf, len, false);
 }
 
-void mpu6050_init(void) {
-    mpu6050_write(0x6B, 0x00);
+/* ===== ISR dos botoes ===== */
+void btn_callback(uint gpio, uint32_t events) {
+    (void)events;
+    btn_event_t ev;
+    ev.pin     = (uint8_t)gpio;
+    ev.pressed = (gpio_get(gpio) == 0);
+    ev.ts_ms   = to_ms_since_boot(get_absolute_time());
+
+    BaseType_t woken = pdFALSE;
+    xQueueSendFromISR(xQueueButtons, &ev, &woken);
+    portYIELD_FROM_ISR(woken);
 }
 
-void calibrate_gyro(void) {
-    printf("[CALIB] Iniciando calibracao... mantenha o controle PARADO.\n");
-    int32_t sum_x = 0, sum_y = 0, sum_z = 0;
-    for (int i = 0; i < CALIB_SAMPLES; i++) {
-        uint8_t buf[6];
-        mpu6050_read(0x43, buf, 6);
-        sum_x += (int16_t)((buf[0] << 8) | buf[1]);
-        sum_y += (int16_t)((buf[2] << 8) | buf[3]);
-        sum_z += (int16_t)((buf[4] << 8) | buf[5]);
-        if (i % 20 == 0) {
-            gpio_put(LED_CALIBRADO, !gpio_get(LED_CALIBRADO));
+/* ===== Tasks ===== */
+void tx_task(void *params) {
+    char c;
+    while (true) {
+        if (xQueueReceive(xQueueTX, &c, portMAX_DELAY) == pdTRUE) {
+            putchar_raw(c);
         }
-        sleep_ms(5);
-    }
-    gyro_offset_x = sum_x / CALIB_SAMPLES;
-    gyro_offset_y = sum_y / CALIB_SAMPLES;
-    gyro_offset_z = sum_z / CALIB_SAMPLES;
-    gyro_calibrated = true;
-    gpio_put(LED_CALIBRADO, 1);
-    printf("[CALIB] Concluida! Offsets -> x=%d  y=%d  z=%d\n",
-           (int)gyro_offset_x, (int)gyro_offset_y, (int)gyro_offset_z);
-}
-
-void setup_buttons(void) {
-    for (int i = 0; i < NUM_BUTTONS; i++) {
-        gpio_init(button_pins[i]);
-        gpio_set_dir(button_pins[i], GPIO_IN);
-        gpio_pull_up(button_pins[i]);
-        button_last[i] = true;
     }
 }
 
-void setup_led(void) {
-    gpio_init(LED_PIN);
-    gpio_set_dir(LED_PIN, GPIO_OUT);
-    gpio_put(LED_PIN, 0);
-    gpio_init(LED_CALIBRADO);
-    gpio_set_dir(LED_CALIBRADO, GPIO_OUT);
-    gpio_put(LED_CALIBRADO, 0);
+/* Le o botao POWER por polling, alterna o estado, atualiza LED e fila */
+void power_task(void *params) {
+    gpio_init(LED_STATUS);
+    gpio_set_dir(LED_STATUS, GPIO_OUT);
+    gpio_put(LED_STATUS, 0);
+
+    gpio_init(BTN_POWER);
+    gpio_set_dir(BTN_POWER, GPIO_IN);
+    gpio_pull_up(BTN_POWER);
+
+    bool ligado   = false;
+    bool last_btn = true; /* solto */
+
+    while (true) {
+        bool cur = gpio_get(BTN_POWER); /* 1 = solto, 0 = apertado */
+
+        if (!cur && last_btn) {
+            /* borda de descida: apertou */
+            ligado = !ligado;
+            gpio_put(LED_STATUS, ligado);
+            xQueueOverwrite(xQueuePower, &ligado);
+
+            char msg[12];
+            snprintf(msg, sizeof(msg), "PWR,%d\n", ligado ? 1 : 0);
+            tx_send(msg);
+
+            vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
+        }
+
+        last_btn = cur;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
 }
 
-void setup_i2c(void) {
+void btn_task(void *params) {
+    btn_event_t ev;
+    uint32_t last_ts[NUM_ACTIONS] = {0, 0, 0, 0};
+
+    while (true) {
+        if (xQueueReceive(xQueueButtons, &ev, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        /* So manda se o controle estiver ligado */
+        if (!power_is_on()) {
+            continue;
+        }
+
+        int idx = -1;
+        for (int i = 0; i < NUM_ACTIONS; i++) {
+            if (action_pins[i] == ev.pin) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx < 0) continue;
+
+        if ((ev.ts_ms - last_ts[idx]) < DEBOUNCE_MS) {
+            continue;
+        }
+        last_ts[idx] = ev.ts_ms;
+
+        char msg[12];
+        snprintf(msg, sizeof(msg), "%s,%d\n",
+                 ev.pressed ? "BD" : "BU", idx + 1);
+        tx_send(msg);
+    }
+}
+
+void imu_task(void *params) {
     i2c_init(I2C_PORT, 400 * 1000);
     gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_SDA);
     gpio_pull_up(I2C_SCL);
-}
 
-void setup_hc06(void) {
-    uart_init(HC06_UART, HC06_BAUD);
-    gpio_set_function(HC06_TX, GPIO_FUNC_UART);
-    gpio_set_function(HC06_RX, GPIO_FUNC_UART);
-    gpio_init(HC06_STATE);
-    gpio_set_dir(HC06_STATE, GPIO_IN);
-}
+    mpu6050_write(0x6B, 0x00);
 
-void test_mpu6050(void) {
     uint8_t who = 0;
     mpu6050_read(0x75, &who, 1);
-    printf("[MPU6050] WHO_AM_I = 0x%02X ", who);
-    if (who == 0x68) {
-        printf("-> OK! Sensor respondendo.\n");
-    } else {
-        printf("-> ERRO! Esperado 0x68.\n");
-    }
-}
+    printf("[MPU6050] WHO_AM_I = 0x%02X %s\n",
+           who, (who == 0x68) ? "OK" : "ERRO");
 
-void read_gyro(void) {
-    uint8_t ax_h, ax_l, ay_h, ay_l, az_h, az_l;
-    mpu6050_read(0x3B, &ax_h, 1);
-    mpu6050_read(0x3C, &ax_l, 1);
-    mpu6050_read(0x3D, &ay_h, 1);
-    mpu6050_read(0x3E, &ay_l, 1);
-    mpu6050_read(0x3F, &az_h, 1);
-    mpu6050_read(0x40, &az_l, 1);
-    int16_t ax = (int16_t)((ax_h << 8) | ax_l);
-    int16_t ay = (int16_t)((ay_h << 8) | ay_l);
-    int16_t az = (int16_t)((az_h << 8) | az_l);
-    printf("[ACC] x=%6d  y=%6d  z=%6d\n", ax, ay, az);
+    while (true) {
+        if (!power_is_on()) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        uint8_t buf[6];
+        mpu6050_read(0x43, buf, 6);
+        int16_t gx = (int16_t)((buf[0] << 8) | buf[1]);
+        int16_t gy = (int16_t)((buf[2] << 8) | buf[3]);
+
+        int dx = gx / 2730;
+        int dy = gy / 2730;
+        if (dx > 12)  dx = 12;
+        if (dx < -12) dx = -12;
+        if (dy > 12)  dy = 12;
+        if (dy < -12) dy = -12;
+
+        if (dx != 0 || dy != 0) {
+            char msg[16];
+            snprintf(msg, sizeof(msg), "M,%d,%d\n", dx, dy);
+            tx_send(msg);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
 }
 
 int main(void) {
     stdio_init_all();
-    sleep_ms(3000);
+    sleep_ms(2000);
 
-    printf("\n=== TESTE DE HARDWARE - Controle Papers Please ===\n");
+    printf("\n=== Passo 6: power + liga/desliga ===\n");
 
-    setup_buttons();
-    setup_led();
-    setup_i2c();
-    setup_hc06();
-
-    mpu6050_init();
-    test_mpu6050();
-    calibrate_gyro();
-
-    uart_puts(HC06_UART, "HC06 OK\n");
-    printf("[HC-06] Enviei 'HC06 OK' pela UART1.\n");
-    printf("[HC-06] STATE atual = %d\n", gpio_get(HC06_STATE));
-
-    uint32_t last_gyro = 0;
-
-    while (true) {
-        for (int i = 0; i < NUM_BUTTONS; i++) {
-            bool pressed = !gpio_get(button_pins[i]);
-            if (pressed != !button_last[i]) {
-                if (pressed) {
-                    printf("[BOTAO] %s pressionado\n", button_names[i]);
-                } else {
-                    printf("[BOTAO] %s solto\n", button_names[i]);
-                }
-                button_last[i] = !pressed;
-            }
-        }
-
-        gpio_put(LED_PIN, !gpio_get(BTN_APPROVE));
-
-        if (uart_is_readable(HC06_UART)) {
-            char c = uart_getc(HC06_UART);
-            printf("[HC-06] recebeu: '%c'\n", c);
-        }
-
-        uint32_t now = to_ms_since_boot(get_absolute_time());
-        if (now - last_gyro >= 1000) {
-            read_gyro();
-            uart_puts(HC06_UART, "TESTE,123\n");   // <<< LINHA DE TESTE: manda pelo Bluetooth 1x/s
-            printf("[HC-06] STATE = %d\n", gpio_get(HC06_STATE));
-            last_gyro = now;
-        }
-
-        sleep_ms(10);
+    for (int i = 0; i < NUM_ACTIONS; i++) {
+        gpio_init(action_pins[i]);
+        gpio_set_dir(action_pins[i], GPIO_IN);
+        gpio_pull_up(action_pins[i]);
     }
+    gpio_set_irq_enabled_with_callback(action_pins[0],
+        GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, btn_callback);
+    for (int i = 1; i < NUM_ACTIONS; i++) {
+        gpio_set_irq_enabled(action_pins[i],
+            GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
+    }
+
+    xQueueTX      = xQueueCreate(256, sizeof(char));
+    xQueueButtons = xQueueCreate(16,  sizeof(btn_event_t));
+    xQueuePower   = xQueueCreate(1,   sizeof(bool));
+
+    /* Estado inicial: desligado */
+    bool off = false;
+    xQueueOverwrite(xQueuePower, &off);
+
+    xTaskCreate(tx_task,    "tx",    512, NULL, 3, NULL);
+    xTaskCreate(power_task, "power", 512, NULL, 2, NULL);
+    xTaskCreate(btn_task,   "btn",   512, NULL, 1, NULL);
+    xTaskCreate(imu_task,   "imu",   512, NULL, 1, NULL);
+
+    vTaskStartScheduler();
+
+    while (true) {}
     return 0;
 }
