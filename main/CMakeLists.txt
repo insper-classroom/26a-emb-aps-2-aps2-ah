@@ -6,12 +6,15 @@ target_include_directories(pico_emb PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
 )
 
-target_link_libraries(pico_emb PRIVATE
+# Deve ter estas linhas para o FreeRTOS funcionar:
+include(FreeRTOS_Kernel_import.cmake)
+
+target_link_libraries(pico_emb
     pico_stdlib
     hardware_i2c
-    hardware_uart
     hardware_gpio
-    hardware_irq
+    FreeRTOS-Kernel
+    FreeRTOS-Kernel-Heap4
 )
 
 if(PICO_CYW43_SUPPORTED)
