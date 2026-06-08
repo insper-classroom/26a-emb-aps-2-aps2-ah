@@ -28,7 +28,7 @@ Os dois botões principais — APPROVE (verde) e DENY (vermelho) — imitam os c
 
 O controle se comunica com o PC via **USB (serial)**, com um script Python no computador escutando as mensagens do controle e traduzindo-as em eventos reais de teclado e mouse no sistema operacional.
 
-Além disso, um **módulo de IA embarcada** (rede neural treinada com Edge Impulse, rodando localmente na Pico) classifica gestos de movimento da IMU em tempo real. O modelo reconhece três classes de movimento e, ao detectar um gesto específico, dispara automaticamente uma ação no jogo e acende um LED indicando o gesto reconhecido — tudo sem conexão com a internet.
+Além disso, um **módulo de IA embarcada** (rede neural treinada com Edge Impulse, rodando localmente na Pico) classifica gestos de movimento da IMU em tempo real. O modelo reconhece três classes de movimento e acende um LED indicando o gesto reconhecido — tudo sem conexão com a internet.
 
 ---
 
@@ -62,11 +62,10 @@ ideias:
 > O botão POWER é monitorado por **polling** dentro da `power_task` via `gpio_get()`.
 
 ### Saídas (atuadores)
-
 | Saída              | Tipo    | Função                                                       |
 | ------------------ | ------- | ------------------------------------------------------------ |
 | LED de status      | Digital | Indica que o controle está ligado / ativo                    |
-| LED de gesto (IA)  | Digital | Acende conforme o movimento classificado pela IA             |
+| LEDs de gesto (IA) | Digital | 3 LEDs (idle, updown, wave) acendem conforme o gesto da IA   |
 | USB (serial)       | Serial  | Envia os eventos do controle para o PC (`controller.py`)     |
 
 ### Pinagem (hardware real)
@@ -78,12 +77,12 @@ ideias:
 | Botão CLICK       | GP14           |
 | Botão INSPECT     | GP12           |
 | Botão POWER       | GP11           |
-| LED de status     | GP17           |
-| LED de gesto (IA) | GP16           |
+| LED de status     | GP16           |
+| LED IA — idle     | GP18           |
+| LED IA — updown   | GP19           |
+| LED IA — wave     | GP20           |
 | MPU6050 — SDA     | GP8 (I2C0)     |
 | MPU6050 — SCL     | GP9 (I2C0)     |
-
----
 
 ## 4. Protocolo de Comunicação
 
@@ -102,7 +101,6 @@ A comunicação entre o controle e o PC é feita por **USB (serial)** usando um 
 | `M,dx,dy\n` | Controle → PC | Movimento relativo do mouse (pixels, com sinal). `dx` e `dy` limitados a ±12. | `M,-3,5\n` |
 | `BD,n\n`    | Controle → PC | Botão n foi pressionado (button down)                                         | `BD,1\n`   |
 | `BU,n\n`    | Controle → PC | Botão n foi solto (button up)                                                 | `BU,1\n`   |
-| `G,classe\n`| Controle → PC | Gesto reconhecido pela IA (ex.: `G,updown`)                                    | `G,updown\n` |
 | `PWR,1\n`   | Controle → PC | Controle foi ligado                                                           | `PWR,1\n`  |
 | `PWR,0\n`   | Controle → PC | Controle foi desligado                                                        | `PWR,0\n`  |
 
@@ -163,7 +161,7 @@ O expert de IA consiste em uma rede neural de reconhecimento de movimento rodand
 | RAM                | ~2.7 KB |
 | Flash              | ~15 KB  |
 
-O modelo foi exportado como **biblioteca C++** (target Cortex-M33 / RP2350) e integrado ao firmware. A inferência roda dentro de uma task FreeRTOS dedicada, que consome as leituras da IMU, classifica o gesto e dispara a ação correspondente.
+O modelo foi exportado como **biblioteca C++** (target Cortex-M33 / RP2350) e integrado ao firmware. A inferência roda dentro de uma task FreeRTOS dedicada (`ia_task`), que consome as leituras da IMU, classifica o gesto e acende o LED correspondente.
 
 ---
 
@@ -177,8 +175,7 @@ O modelo foi exportado como **biblioteca C++** (target Cortex-M33 / RP2350) e in
 | ----------------- | ---------- | ------------------------------------------------------------------------------- |
 | `tx_task`         | 3          | Consome `xQueueTX` e escreve as mensagens na serial USB                         |
 | `power_task`      | 2          | Trata botão POWER por polling; atualiza LED de status; envia `PWR,n\n`           |
-| `imu_task`        | 1          | Lê MPU6050 a ~100 Hz, calibra no boot, aplica clamp e enfileira `M,dx,dy\n`      |
-| `inference_task`  | 1          | Acumula o buffer da IMU, roda a inferência da IA, enfileira `G,classe\n` e acende o LED de gesto |
+| `ia_task`         | 1          | Acumula o buffer da IMU, roda a inferência da IA e acende o LED do gesto reconhecido |
 | `btn_task`        | 1          | Consome `xQueueButtons`, aplica debounce e enfileira `BD/BU,n\n`                 |
 
 ### ISR
@@ -193,8 +190,8 @@ O modelo foi exportado como **biblioteca C++** (target Cortex-M33 / RP2350) e in
 | --------------- | -------------------------------- | ------------------------------------------------------------------- |
 | `xQueueButtons` | Fila                             | Eventos crus de botão (ISR → `btn_task`)                            |
 | `xQueueTX`      | Fila                             | Mensagens a serem transmitidas pela serial (qualquer task → `tx_task`) |
-| `xQueuePower`   | Event group / notify             | Estado liga/desliga do controle, distribuído às tasks consumidoras   |
-| `xSemRate`      | Semáforo de contagem             | Rate limiting do movimento da IMU                                   |
+| `xQueuePower`   | Fila (1 slot, `xQueueOverwrite`) | Estado liga/desliga do controle, lido pelas tasks via `xQueuePeek`  |
+| `xQueueIMU`     | Fila                             | Janela de amostras da IMU (`imu_task` → `ia_task`)                  |                                |
 
 > Toda a comunicação entre tasks é feita exclusivamente por primitivas do FreeRTOS — **nenhuma variável global de estado**.
 
@@ -208,7 +205,6 @@ Script Python que:
 - Lê as linhas do controle.
 - Converte `M,dx,dy` em `pyautogui.moveRel()`.
 - Converte `BD/BU,n` em `keyDown/keyUp` ou `mouseDown/mouseUp`.
-- Interpreta `G,classe` (gesto da IA) e dispara a ação correspondente no jogo.
 - Ao encerrar (Ctrl+C), libera qualquer tecla/botão que esteja pressionado.
 
 Dependências: `pyserial`, `pyautogui`.
@@ -216,7 +212,4 @@ Dependências: `pyserial`, `pyautogui`.
 ---
 
 ## 8. Experts escolhidos
-
-**IA embarcada (Edge Impulse):** rede neural de reconhecimento de movimento rodando localmente na Pico, sem internet. Classifica três gestos da IMU (`idle`, `updown`, `wave`) com 99.8% de acurácia na validação. A inferência roda em uma task FreeRTOS dedicada e dispara ações no jogo / acende um LED conforme o gesto reconhecido.
-
-**RTOS avançado:** múltiplas tasks com prioridades distintas, filas e semáforo de contagem. Comunicação inter-task exclusivamente por primitivas FreeRTOS — nenhuma variável global de estado. A IA é integrada como uma task de inferência dentro da arquitetura RTOS.
+**IA embarcada (Edge Impulse):** rede neural de reconhecimento de movimento rodando localmente na Pico, sem internet. Classifica três gestos da IMU (`idle`, `updown`, `wave`) com 99.8% de acurácia na validação. A inferência roda em uma task FreeRTOS dedicada (`ia_task`) e acende um LED conforme o gesto reconhecido.
