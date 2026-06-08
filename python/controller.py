@@ -3,8 +3,8 @@ import time
 import serial
 import pyautogui
 
-PORT = "COM6"
-BAUD = 9600
+PORT = "COM4"        # <<< troque pela COM real da sua Pico (a mesma do Serial Monitor)
+BAUD = 115200        # USB serial da Pico
 
 pyautogui.PAUSE = 0
 pyautogui.FAILSAFE = True
@@ -89,7 +89,7 @@ def main():
         ser = serial.Serial(PORT, BAUD, timeout=0.1)
     except serial.SerialException as e:
         print(f"ERRO ao abrir a porta {PORT}: {e}")
-        print("Confira se o controle esta pareado e se a COM esta correta.")
+        print("Confira a COM da Pico e feche o Serial Monitor antes de rodar.")
         sys.exit(1)
 
     print("Conectado! Controle ativo. Ctrl+C para sair.")

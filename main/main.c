@@ -186,8 +186,8 @@ void imu_task(void *params) {
         int16_t gx = (int16_t)((g[0] << 8) | g[1]);
         int16_t gy = (int16_t)((g[2] << 8) | g[3]);
 
-        int dx = gx / 2730;
-        int dy = gy / 2730;
+        int dx = gx / 1000;
+        int dy = gy / 1000;
         if (dx > 12)  dx = 12;
         if (dx < -12) dx = -12;
         if (dy > 12)  dy = 12;
