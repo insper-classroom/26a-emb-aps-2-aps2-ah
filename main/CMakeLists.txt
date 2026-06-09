@@ -46,6 +46,7 @@ target_link_libraries(pico_emb
     pico_stdlib
     hardware_gpio
     hardware_i2c
+    hardware_pwm
     FreeRTOS-Kernel
     FreeRTOS-Kernel-Heap4
 )

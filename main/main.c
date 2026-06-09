@@ -1,5 +1,5 @@
 /*
- * main.c — Passo 6 + IA (LED + serial)
+ * main.c — Passo 6 + IA (LED + serial) + buzzer
  */
 
 #include <stdio.h>
@@ -7,6 +7,7 @@
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/i2c.h"
+#include "hardware/pwm.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -20,6 +21,8 @@ extern int ia_window_size(void);
 #define LED_IA_IDLE   18
 #define LED_IA_UPDOWN 19
 #define LED_IA_WAVE   20
+
+#define BUZZER        21
 
 #define BTN_APPROVE   13
 #define BTN_DENY      15
@@ -41,7 +44,8 @@ const uint action_pins[] = {BTN_APPROVE, BTN_DENY, BTN_CLICK, BTN_INSPECT};
 QueueHandle_t xQueueTX;
 QueueHandle_t xQueueButtons;
 QueueHandle_t xQueuePower;
-QueueHandle_t xQueueIMU;   /* janela de IA pronta -> ia_task */
+QueueHandle_t xQueueIMU;
+QueueHandle_t xQueueBuzzer;   /* aviso pra buzzer_task: 1=aprovar, 2=negar */
 
 typedef struct {
     uint8_t  pin;
@@ -49,7 +53,6 @@ typedef struct {
     uint32_t ts_ms;
 } btn_event_t;
 
-/* Buffer de uma janela: 166*3 floats */
 typedef struct {
     float data[IA_WINDOW * 3];
 } ia_window_t;
@@ -78,6 +81,23 @@ void mpu6050_read(uint8_t reg, uint8_t *buf, uint8_t len) {
     i2c_read_blocking(I2C_PORT, MPU_ADDR, buf, len, false);
 }
 
+/* ===== Buzzer (PWM) ===== */
+void buzzer_tom(uint freq, uint ms) {
+    uint slice = pwm_gpio_to_slice_num(BUZZER);
+    if (freq == 0) {
+        pwm_set_enabled(slice, false);
+        vTaskDelay(pdMS_TO_TICKS(ms));
+        return;
+    }
+    uint32_t clk = 125000000;
+    uint32_t wrap = clk / freq;
+    pwm_set_wrap(slice, wrap);
+    pwm_set_gpio_level(BUZZER, wrap / 2);  /* 50% duty */
+    pwm_set_enabled(slice, true);
+    vTaskDelay(pdMS_TO_TICKS(ms));
+    pwm_set_enabled(slice, false);
+}
+
 /* ===== ISR botoes ===== */
 void btn_callback(uint gpio, uint32_t events) {
     (void)events;
@@ -100,7 +120,27 @@ void tx_task(void *params) {
         }
     }
 }
+void buzzer_task(void *params) {
+    gpio_set_function(BUZZER, GPIO_FUNC_PWM);
 
+    uint8_t som;
+    while (true) {
+        if (xQueueReceive(xQueueBuzzer, &som, portMAX_DELAY) != pdTRUE) continue;
+
+        if (som == 1) {
+            /* APROVAR: agudo, subindo */
+            buzzer_tom(1800, 90);
+            buzzer_tom(2400, 90);
+            buzzer_tom(3000, 160);
+        } else if (som == 2) {
+            /* NEGAR: menos agudo, descendo */
+            buzzer_tom(3000, 160);
+            buzzer_tom(2400, 90);
+            buzzer_tom(1800, 90);
+            
+        }
+    }
+}
 void power_task(void *params) {
     gpio_init(LED_STATUS);
     gpio_set_dir(LED_STATUS, GPIO_OUT);
@@ -148,6 +188,16 @@ void btn_task(void *params) {
         char msg[12];
         snprintf(msg, sizeof(msg), "%s,%d\n", ev.pressed ? "BD" : "BU", idx + 1);
         tx_send(msg);
+
+        /* Toca buzzer ao apertar (button down) verde(1) ou vermelho(2) */
+        if (ev.pressed) {
+            uint8_t som = 0;
+            if (idx + 1 == 1) som = 1;       /* APPROVE */
+            else if (idx + 1 == 2) som = 2;  /* DENY */
+            if (som != 0) {
+                xQueueSend(xQueueBuzzer, &som, 0);
+            }
+        }
     }
 }
 
@@ -164,6 +214,19 @@ void imu_task(void *params) {
     mpu6050_read(0x75, &who, 1);
     printf("[MPU6050] WHO_AM_I = 0x%02X %s\n", who, (who == 0x68) ? "OK" : "ERRO");
 
+    /* Calibra o offset do giroscopio */
+    int32_t soma_gx = 0, soma_gy = 0;
+    for (int i = 0; i < 100; i++) {
+        uint8_t g[6];
+        mpu6050_read(0x43, g, 6);
+        soma_gx += (int16_t)((g[0] << 8) | g[1]);
+        soma_gy += (int16_t)((g[2] << 8) | g[3]);
+        sleep_ms(5);
+    }
+    int16_t off_gx = soma_gx / 100;
+    int16_t off_gy = soma_gy / 100;
+    printf("[GYRO] offset gx=%d gy=%d\n", off_gx, off_gy);
+
     static ia_window_t win;
     int idx = 0;
 
@@ -173,18 +236,16 @@ void imu_task(void *params) {
             continue;
         }
 
-        /* Acelerometro (pra IA) */
         uint8_t a[6];
         mpu6050_read(0x3B, a, 6);
         int16_t ax = (int16_t)((a[0] << 8) | a[1]);
         int16_t ay = (int16_t)((a[2] << 8) | a[3]);
         int16_t az = (int16_t)((a[4] << 8) | a[5]);
 
-        /* Giroscopio (pro mouse) */
         uint8_t g[6];
         mpu6050_read(0x43, g, 6);
-        int16_t gx = (int16_t)((g[0] << 8) | g[1]);
-        int16_t gy = (int16_t)((g[2] << 8) | g[3]);
+        int16_t gx = (int16_t)((g[0] << 8) | g[1]) - off_gx;
+        int16_t gy = (int16_t)((g[2] << 8) | g[3]) - off_gy;
 
         int dx = gx / 1000;
         int dy = gy / 1000;
@@ -200,7 +261,6 @@ void imu_task(void *params) {
             tx_send(msg);
         }
 
-        /* Alimenta o buffer da IA */
         win.data[idx * 3 + 0] = (float)ax;
         win.data[idx * 3 + 1] = (float)ay;
         win.data[idx * 3 + 2] = (float)az;
@@ -239,11 +299,6 @@ void ia_task(void *params) {
         gpio_put(LED_IA_IDLE,   strcmp(label, "idle")   == 0);
         gpio_put(LED_IA_UPDOWN, strcmp(label, "updown") == 0);
         gpio_put(LED_IA_WAVE,   strcmp(label, "wave")   == 0);
-
-        /* Gesto updown vira clique no jogo (so com confianca alta) */
-        if (conf > 0.8f && strcmp(label, "updown") == 0) {
-            tx_send("G,updown\n");
-        }
     }
 }
 
@@ -251,7 +306,9 @@ int main(void) {
     stdio_init_all();
     sleep_ms(2000);
 
-    printf("\n=== Controle + IA (LED) ===\n");
+    printf("\n=== Controle + IA + buzzer ===\n");
+
+
 
     for (int i = 0; i < NUM_ACTIONS; i++) {
         gpio_init(action_pins[i]);
@@ -269,15 +326,17 @@ int main(void) {
     xQueueButtons = xQueueCreate(16,  sizeof(btn_event_t));
     xQueuePower   = xQueueCreate(1,   sizeof(bool));
     xQueueIMU     = xQueueCreate(2,   sizeof(ia_window_t));
+    xQueueBuzzer  = xQueueCreate(8,   sizeof(uint8_t));
 
     bool off = false;
     xQueueOverwrite(xQueuePower, &off);
 
-    xTaskCreate(tx_task,    "tx",    512,  NULL, 3, NULL);
-    xTaskCreate(power_task, "power", 512,  NULL, 2, NULL);
-    xTaskCreate(btn_task,   "btn",   512,  NULL, 1, NULL);
-    xTaskCreate(imu_task,   "imu",   1024, NULL, 1, NULL);
-    xTaskCreate(ia_task,    "ia",    4096, NULL, 1, NULL);
+    xTaskCreate(tx_task,     "tx",     512,  NULL, 3, NULL);
+    xTaskCreate(power_task,  "power",  512,  NULL, 2, NULL);
+    xTaskCreate(btn_task,    "btn",    512,  NULL, 1, NULL);
+    xTaskCreate(buzzer_task, "buzzer", 512,  NULL, 1, NULL);
+    xTaskCreate(imu_task,    "imu",    1024, NULL, 1, NULL);
+    xTaskCreate(ia_task,     "ia",     4096, NULL, 1, NULL);
 
     vTaskStartScheduler();
     while (true) {}

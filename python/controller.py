@@ -3,7 +3,7 @@ import time
 import serial
 import pyautogui
 
-PORT = "COM11"        # troque pela COM real da sua Pico
+PORT = "COM4"        # troque pela COM real da sua Pico
 BAUD = 115200
 
 pyautogui.PAUSE = 0
