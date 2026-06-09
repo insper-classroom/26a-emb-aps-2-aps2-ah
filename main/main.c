@@ -221,7 +221,7 @@ void imu_task(void *params) {
         mpu6050_read(0x43, g, 6);
         soma_gx += (int16_t)((g[0] << 8) | g[1]);
         soma_gy += (int16_t)((g[2] << 8) | g[3]);
-        sleep_ms(5);
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
     int16_t off_gx = soma_gx / 100;
     int16_t off_gy = soma_gy / 100;
