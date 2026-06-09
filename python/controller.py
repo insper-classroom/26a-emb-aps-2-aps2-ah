@@ -3,63 +3,93 @@ import time
 import serial
 import pyautogui
 
-PORT = "COM4"        # <<< troque pela COM real da sua Pico (a mesma do Serial Monitor)
-BAUD = 115200        # USB serial da Pico
+PORT = "COM11"        # troque pela COM real da sua Pico
+BAUD = 115200
 
 pyautogui.PAUSE = 0
 pyautogui.FAILSAFE = True
 
-BUTTON_MAP = {
-    1: ("key", "a"),
-    2: ("key", "x"),
-    3: ("mouse", "left"),
-    4: ("key", "i"),
-}
+# Posicoes fixas na tela (medidas no jogo)
+POS_APROVAR = (1568, 415)   # botao verde (APPROVE)
+POS_NEGAR   = (1208, 415)   # botao vermelho (DENY)
+POS_ABRIR   = (1800, 528)   # abrir a bandeja de carimbos
 
-pressed_keys = set()
+DEADZONE = 2   # ignora movimento pequeno (drift)
+
 pressed_mouse = set()
+
+# Quando > 0, o movimento do giroscopio fica bloqueado (durante um carimbo)
+bloqueio_mov = 0.0
+
+
+def clicar_em(pos):
+    """Move pro ponto e clica, dando tempo do jogo registrar."""
+    global bloqueio_mov
+    bloqueio_mov = time.time() + 0.4   # trava o movimento por 0.4s
+    try:
+        pyautogui.moveTo(pos[0], pos[1])
+        time.sleep(0.08)
+        pyautogui.click()
+        time.sleep(0.05)
+    except pyautogui.FailSafeException:
+        pass
 
 
 def handle_button_down(n):
-    if n not in BUTTON_MAP:
-        return
-    kind, value = BUTTON_MAP[n]
-    if kind == "key":
-        pyautogui.keyDown(value)
-        pressed_keys.add(value)
-    elif kind == "mouse":
-        pyautogui.mouseDown(button=value)
-        pressed_mouse.add(value)
+    if n == 1:        # APPROVE (verde) -> carimba aprovar
+        clicar_em(POS_APROVAR)
+    elif n == 2:      # DENY (vermelho) -> carimba negar
+        clicar_em(POS_NEGAR)
+    elif n == 3:      # CLICK -> segura clique onde o cursor esta (arrastar)
+        try:
+            pyautogui.mouseDown(button="left")
+            pressed_mouse.add("left")
+        except pyautogui.FailSafeException:
+            pass
+    elif n == 4:      # INSPECT (GP12) -> abre a bandeja de carimbos
+        clicar_em(POS_ABRIR)
 
 
 def handle_button_up(n):
-    if n not in BUTTON_MAP:
-        return
-    kind, value = BUTTON_MAP[n]
-    if kind == "key":
-        pyautogui.keyUp(value)
-        pressed_keys.discard(value)
-    elif kind == "mouse":
-        pyautogui.mouseUp(button=value)
-        pressed_mouse.discard(value)
+    if n == 3:
+        if "left" in pressed_mouse:
+            try:
+                pyautogui.mouseUp(button="left")
+            except pyautogui.FailSafeException:
+                pass
+            pressed_mouse.discard("left")
 
 
 def handle_move(dx, dy):
-    pyautogui.moveRel(dx, dy, duration=0)
+    # Ignora movimento enquanto um carimbo esta acontecendo
+    if time.time() < bloqueio_mov:
+        return
+    if abs(dx) < DEADZONE:
+        dx = 0
+    if abs(dy) < DEADZONE:
+        dy = 0
+    if dx == 0 and dy == 0:
+        return
+    try:
+        pyautogui.moveRel(dx, dy, duration=0)
+    except pyautogui.FailSafeException:
+        pass
 
 
 def release_all():
-    for value in list(pressed_keys):
-        pyautogui.keyUp(value)
     for value in list(pressed_mouse):
-        pyautogui.mouseUp(button=value)
-    pressed_keys.clear()
+        try:
+            pyautogui.mouseUp(button=value)
+        except pyautogui.FailSafeException:
+            pass
     pressed_mouse.clear()
 
 
 def parse_line(line):
     line = line.strip()
     if not line:
+        return
+    if line.startswith("[") or line.startswith("="):
         return
 
     parts = line.split(",")
@@ -77,10 +107,8 @@ def parse_line(line):
             if estado == 0:
                 release_all()
             print(f"[PWR] controle {'ligado' if estado == 1 else 'desligado'}")
-        else:
-            print(f"[?] linha ignorada: {line}")
     except ValueError:
-        print(f"[!] linha corrompida: {line}")
+        pass
 
 
 def main():

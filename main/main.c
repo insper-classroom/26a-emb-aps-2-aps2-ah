@@ -239,6 +239,11 @@ void ia_task(void *params) {
         gpio_put(LED_IA_IDLE,   strcmp(label, "idle")   == 0);
         gpio_put(LED_IA_UPDOWN, strcmp(label, "updown") == 0);
         gpio_put(LED_IA_WAVE,   strcmp(label, "wave")   == 0);
+
+        /* Gesto updown vira clique no jogo (so com confianca alta) */
+        if (conf > 0.8f && strcmp(label, "updown") == 0) {
+            tx_send("G,updown\n");
+        }
     }
 }
 
